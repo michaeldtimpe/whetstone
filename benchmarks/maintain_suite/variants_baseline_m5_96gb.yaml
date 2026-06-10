@@ -1,0 +1,21 @@
+# Phase 0 — champion baseline on M5 Max at the 96 GB cap.
+#
+# This is the DENOMINATOR for every track delta (whetstone.sdd: cite deltas vs
+# baseline_m5_96gb, never old-M1/auto-cap absolutes). Run it THREE times to
+# confirm the temp=0 determinism claim holds on M5 GPU before starting Track A:
+#
+#   for rep in 1 2 3; do
+#     .venv/bin/python -m benchmarks.maintain_suite.run \
+#       --variants benchmarks/maintain_suite/variants_baseline_m5_96gb.yaml \
+#       --output acceptance/baseline_m5_96gb/rep$rep \
+#       --per-fixture-timeout 1800 --all --keep-loaded
+#   done
+#
+# Then diff the three comparison.json pass-vectors. ANY per-fixture pass-vector
+# shift across reps = a determinism failure → investigate oMLX MoE top-k routing
+# / GPU thread-schedule nondeterminism BEFORE Track A (see plan §Phase 0).
+#
+# 1 cell × 10 fixtures × 3 reps = 30 runs, ~25–40 min wall.
+
+variants:
+  - {mode: mono, model_label: qwen3.6-35b-a3b-6bit, model_id: Qwen3.6-35B-A3B-6bit}

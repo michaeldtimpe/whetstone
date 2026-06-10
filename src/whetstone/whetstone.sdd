@@ -1,0 +1,58 @@
+# whetstone
+
+Root invariants for the whetstone codebase. Picked up by `find_all_sdd` and
+surfaced to the model in the task prompt when `set_repo_root` points at
+the whetstone checkout itself; read by humans and Claude Code as the
+authoritative architectural contract.
+
+whetstone is the **M5-era research fork of luxe** (forked from luxe HEAD).
+Its mandate is to re-open, under the 96 GB M5 Max memory envelope, the
+decisions luxe/deluxe closed under the old 36 GB M1 cap, and to bank any
+reproducible improvement over the luxe champion. Unlike luxe (mono-only) and
+deluxe (dense-only, mono-only), whetstone is **permitted to run multi-model
+pipelines** — specifically the sanctioned planner/builder split under
+`src/whetstone/agents/pipeline/**`. This is the single deliberate
+architectural divergence from luxe; everything else stays a faithful fork.
+
+Sourced from `lessons.md` postmortems, the approved plan
+(`~/.claude/plans/soft-meandering-gadget.md`), and durable user auto-memory.
+
+## Must
+- temp=0.0 in production fixture configs (determinism; pinned by luxe variance probe)
+- Establish a fresh `acceptance/baseline_m5_96gb/` (champion at the 96 GB cap, 3× for
+  determinism) as the comparison denominator; every track cites deltas vs that baseline,
+  never old-M1 or auto-cap absolutes
+- Memory envelope is **96 GB** (`iogpu.wired_limit_mb=98304`, oMLX `max_model_memory:"96GB"`,
+  `max_process_memory:"110GB"`); a variant aborts rather than exceed it
+- Multi-model pipelines are permitted ONLY under `src/whetstone/agents/pipeline/**`; the
+  builder pass reuses `agents/loop.py:run_agent` and `single.py:_build_full_tool_surface`
+  unchanged for tool-surface parity (no forked loop)
+- Per-track / per-role model selection is permitted (planner ≠ builder); record the roster
+  and write results under `acceptance/<track>_m5_96gb/`
+- All prompt strings (mono AND planner) go through `src/whetstone/agents/prompts.py` registry
+- Pin `--work-dir ~/.whetstone/bench-workspace` for bench runs (random tempdir leaks into prompts)
+- `oMLX` `idle_timeout_seconds: 1800` by default; raise to 3600 (or pin `--keep-loaded`) during
+  pipeline runs so the planner is not evicted between Pass 1 and Pass 2
+- `--keep-loaded` for bench mode (post-run unload fires by default); `unload_all_loaded()` MUST
+  fire at every variant cleanup boundary, including on bailout, so a resident model never
+  poisons the next fixture's baseline
+- Read the shared, read-only fixture cache at `~/.luxe/fixture-cache/` (shared with luxe for
+  cross-repo delta comparability — do NOT repoint to `~/.whetstone/`)
+- Upstream any harness/bench fix discovered here to luxe; the pipeline package is the only
+  sanctioned divergence and must not silently fork shared logic
+
+## Must not
+- Read `origin/<branch>` in offline-cache repos (stale-ref trap; use local ref or sidecar regrade)
+- Use MoE Instruct-2507 model family (long-context fabrication, skips optional tool calls)
+- Use `--no-verify`, `--no-gpg-sign`, or other hook-skip flags
+- Force-push to `main` or `master`
+- Run two model rosters concurrently (≥80 GB peak; sequential bake-offs only)
+- Compare whetstone runs against luxe/deluxe acceptance JSON collected on other hardware/caps
+
+## Owns
+- src/whetstone/**
+
+## Forbids
+- src/swarm/**
+- src/micro/**
+- src/phased/**

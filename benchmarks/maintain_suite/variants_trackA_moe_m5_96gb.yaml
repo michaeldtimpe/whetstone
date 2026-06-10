@@ -1,0 +1,31 @@
+# Track A — larger-MoE re-confirm on M5 Max at the 96 GB cap.
+#
+# Re-confirms the 2026-05-10 result (larger MoEs pass the gate but don't beat the
+# champion on speed) at the new 96 GB cap, AND validates the forked harness — in
+# particular that the ported unload_all_loaded() fires on variant rotation so the
+# 73 GB / 67 GB cells never stack on the prior resident.
+#
+# Adds the GLM-4.5-Air 6-bit quant-test cell (now staged): did 4-bit cost GLM the
+# 10th fixture? (4-bit was 9/10 @ 94s on 2026-05-10.)
+#
+# Memory peak per cell (weights + ~5-9 GB KV at 32k):
+#   Qwen3.6-35B-A3B-6bit (champion floor):  ~29 + 8 = ~37 GB
+#   Qwen3-Coder-Next 80B-A3B-6bit:          ~65 + 8 = ~73 GB
+#   GLM-4.5-Air 106B-A12B 4bit:             ~58 + 9 = ~67 GB
+#   GLM-4.5-Air 106B-A12B 6bit:             ~82 + 9 = ~91 GB  ← near the cap; watch for paging
+#
+# Llama-4-Scout stays OUT until oMLX bumps the transformers validator past the
+# attn_temperature_tuning bug (see variants_m5max_moe.yaml header / lessons.md).
+#
+# Run:
+#   .venv/bin/python -m benchmarks.maintain_suite.run \
+#     --variants benchmarks/maintain_suite/variants_trackA_moe_m5_96gb.yaml \
+#     --output acceptance/trackA_moe_m5_96gb --per-fixture-timeout 1800 --all
+#
+# 4 cells × 10 fixtures = 40 runs. Champion cell re-anchors against baseline_m5_96gb.
+
+variants:
+  - {mode: mono, model_label: qwen3.6-35b-a3b-6bit,           model_id: Qwen3.6-35B-A3B-6bit}
+  - {mode: mono, model_label: qwen3-coder-next-80b-a3b-6bit,  model_id: Qwen3-Coder-Next-6bit}
+  - {mode: mono, model_label: glm-4.5-air-106b-a12b-4bit,     model_id: GLM-4.5-Air-4bit}
+  - {mode: mono, model_label: glm-4.5-air-106b-a12b-6bit,     model_id: GLM-4.5-Air-6bit}

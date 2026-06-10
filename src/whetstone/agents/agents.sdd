@@ -1,0 +1,160 @@
+# agents
+
+The agent loop and prompt surface. Single source of truth for prompt
+strings; the registry pattern keeps variant cells coupled to runtime.
+
+## Must
+- All prompt strings (mono task variants AND the planner variant) live in
+  `src/whetstone/agents/prompts.py` `PROMPT_REGISTRY`
+- `TaskOverlay` maps `task_type` to `PromptVariant` id; routing goes through `resolve_prompt_ids`
+- `run_agent` (loop.py) owns the inner tool-call loop; `single.py` is the mono entry
+- Mode B write-pressure injection (v1.4.1) is opt-in via `WHETSTONE_WRITE_PRESSURE=1`
+- SpecDD Lever 2 chain block (`_build_sdd_block`) is appended after the variant's `task_prefix`
+
+### Planner/builder pipeline (whetstone research divergence; pinned 2026-05-29)
+
+- The sanctioned multi-model pipeline lives ONLY in `src/whetstone/agents/pipeline/**`
+  (`planner_builder.py:run_planner_builder`). It is whetstone's one deliberate departure
+  from luxe's mono-only architecture (see root `whetstone.sdd`); swarm/micro/phased stay forbidden.
+- **No forked loop**: the builder pass MUST call the unchanged `loop.py:run_agent` with the
+  full tool surface from `single.py:_build_full_tool_surface`, so builder tool-surface parity
+  with mono is structural, not re-derived.
+- **Planner prompt is registry-bound**: the Gemma planner system/task prompt is a
+  `PromptVariant` in `PROMPT_REGISTRY` with a test in `tests/test_prompts.py` — never inlined
+  in `pipeline/planner_builder.py` or `cli.py`. The planner emits a structured plan via
+  `backend.chat(response_format={"type":"json_object"})`; an unparseable plan fails CLOSED
+  (the builder runs from the raw task, as if mono).
+- **Plan injection mirrors the sdd block**: the resolved plan is appended to the builder's
+  `task_prompt` the same way `_build_sdd_block` output is — additive context, not a new turn.
+
+### Reflection / verify stage invariants (Track 1, pinned 2026-05-24)
+
+- **reflect surface ownership**: `reflect.py` is the single source of truth for the
+  verifier/critique prompt surface (the `_VERIFIER_SYSTEM` + per-driver templates). This
+  is DISTINCT from `PROMPT_REGISTRY` (task-completion variants) by design — the verifier
+  is a separate "second-look" critic, not a `run_agent` task prompt. New verifier prompt
+  wording still requires a test in `tests/test_prompts.py` (the registry rule's intent).
+- **opt-in + disable-equivalence**: the stage is gated by `WHETSTONE_REFLECT` (default unset →
+  off). With it off, generation is byte-identical (the primitive is pure; call sites gate).
+- **verify-only is non-perturbing**: a verify call is a SEPARATE `backend.chat`; in
+  verify-only mode it never mutates the work being judged. So Phase 1 can be measured
+  offline by replaying it over stored transcripts without changing any benchmark verdict.
+- **`gap` requires a substantiated FUNCTIONAL BLOCKER**: `gap=true` only when the model
+  both asserts it AND supplies ≥1 deficiency; stylistic/suboptimal observations never flip
+  it (defends the false-gap metric). Unparseable verdicts fail CLOSED (gap=false).
+- **deterministic, no persistence**: temp=0; reflect must not read or write cross-run state.
+
+### Phase 2 repair invariants (multi_turn; pinned 2026-05-24)
+
+- **two-gate fire (give-up signature AND verify gap)**: the repair stage fires only when
+  a turn produced ZERO tool calls (`adapter._is_giveup_turn` — the empty_turn give-up
+  signature) AND a separate verify call returns `gap=true`. The structural gate goes
+  FIRST — it gates the expensive verify call and, by construction, skips the verifier's
+  reporting-gap false-gaps (which have non-empty action sets). A verify call is never
+  made on a turn that already acted.
+- **locked repair budget**: exactly ONE corrective re-prompt per flagged turn (a single
+  `_whetstone_repair`-marked user nudge + one bounded step pass over the SAME exposed tool
+  surface). Hard stop: no re-verify, no second repair, no loop. The re-prompt's step loop is
+  capped at `_REPAIR_MAX_STEPS` (=4) — TIGHTER than the initial turn's `_MAX_STEPS_PER_TURN`
+  (=15) — to bound the over-action/runaway mode (the Phase-2 `miss_func_112` 6-step/51-call
+  spiral); `_MAX_CALLS_PER_PROBLEM` still backstops the whole problem. The cap is
+  artifact-scoped (covers every observed Phase-2 repair in the A/B archive), not re-benched.
+- **same tool surface**: the repair re-prompt is driven with the turn's already-computed
+  `openai_tools` (the per-turn exposed surface) — repair may NOT widen the surface or
+  invoke tools outside the original trajectory's surface (pre-registered budget).
+- **append-to-same-turn**: repair output extends `decoded_turns[-1]` (the give-up turn),
+  never a new turn entry — turn count must stay aligned with the GT turn count.
+- **generic nudge**: `reflect.repair_nudge` carries no benchmark semantics; it re-states
+  the request as unfinished and lists the verifier's deficiencies (consuming the verdict,
+  not re-solving). The `_whetstone_repair` marker keeps the nudge out of later verify contexts.
+
+### forge-hybrid Phase 2 (A) compaction invariants (pinned 2026-05-28, DEFAULT-ON)
+
+- **TieredCompact ships default-ON** (`WHETSTONE_TIERED_COMPACT` defaults to enabled; set to "0"
+  to disable for ablation). The 4-arm n=75 sweep (OFF / 0.75 / 0.50 / 0.40) + 4-arm
+  n=14 stress + 2-rep noise validation at phase_thresholds=(0.50, 0.85, 0.95) jointly
+  established: resolve rate is equivalent to no-compaction baseline within substrate
+  noise band (±2.8 at n=75); wall improvement is 42-56% (well outside substrate wall
+  noise ~20%); 2 protected wrong_target instances (matplotlib-25775, pylint-6528) heal
+  via phase-1 fires; zero new wrong_target damages. This is the cycle's only Pareto-
+  positive lever.
+- **Default phase_thresholds = (0.50, 0.85, 0.95)** owned by
+  `whetstone.context.TieredCompact._DEFAULT_PHASE_THRESHOLDS`. Aggressive phase 1 (50% pressure)
+  captures protective phase-1 wins (drop _whetstone_nudge + truncate tool_results); conservative
+  phase 3 (95% pressure) avoids the destructive reasoning-drop mode (observed at 1/75
+  firing rate at this threshold). The phase-1-helps / phase-3-hurts split is the cycle's
+  load-bearing design finding.
+- **Strict counter discipline**: `writes_seen`, `reads`, `tool_calls_total`, and all
+  `*_fired` flags are explicit integer/boolean state owned by `run_agent`. They are
+  NEVER recomputed by scanning `messages`. Compaction can drop arbitrary message-level
+  content from the eligible region; loop state must stay consistent under compaction.
+  This is a regression guard against any future "lazy fix" that derives counters from
+  message inspection.
+- **Marker-based nudge identification**: TieredCompact identifies droppable nudges
+  via the `_whetstone_nudge` (and `_whetstone_repair`) keys on message dicts, NOT by body-text
+  matching. Body-text matching is FORBIDDEN — it's fragile under message-text drift.
+  Every guardrail that injects a nudge MUST tag the message with `_whetstone_nudge=True` and
+  `_whetstone_nudge_type="<guard_name>"`. See `docs/whetstone-markers-audit.md`.
+- **Protected messages**: `messages[0]` (system prompt) and `messages[1]` (original
+  task) are NEVER eligible for compaction. The last `keep_recent` assistant-message
+  iterations are also protected. Compaction operates only on messages indexed
+  `[2, eligible_end)`.
+
+### forge-hybrid Phase 3 (B) respond-terminal invariants (pinned 2026-05-28, opt-in)
+
+- **`WHETSTONE_RESPOND_TERMINAL` defaults OFF.** The B1+B2 smoke at n=14 confirmed the
+  champion does NOT call the respond tool organically (0/14 adoption) and does NOT
+  call it under explicit prompt guidance (0/14 adoption with `swebench_bugfix_respond`).
+  The lever is in-tree as infrastructure but does not engage on this champion; future
+  cycles may re-attempt if a different champion is fielded.
+- **4 watchdog gates** when the flag IS set: (1) compaction-phantom (Phase ≥2 + writes==0),
+  (2) early-respond (writes==0 + step<4), (3) no-writes-late (writes==0 + step≥4),
+  (4) passive-surrender (writes≥1 + step≤last_write_step). First match wins; non-terminal
+  gates inject typed reprompt + continue.
+
+### forge-hybrid Phase 4 (D) trajectory-shape invariants (pinned 2026-05-28, opt-in)
+
+- **`WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE` defaults OFF.** The D smoke at n=14 confirmed
+  the locked predicate (`sustained_low_trend ≥ 3 AND grep_vs_read_ratio < 0.5 AND
+  breadth_saturation < 0.6`) is too narrow for this champion at num_ctx=32768: 0/14
+  suppression fires across the smoke set. The lever is in-tree as infrastructure but
+  the predicate does not engage; future cycles may trace-mine to find empirically-grounded
+  thresholds.
+- **Implicit dependency on `WHETSTONE_ADAPTIVE_POLICY=1`** for `score_log` population. With
+  adaptive policy off, the predicate is a no-op (sustained_low_trend = 0). This is a
+  documented coupling, not a bug.
+
+## Must not (reflect)
+
+- Encode benchmark semantics in verifier prompts (e.g. "a tool call was warranted") —
+  evaluator-shaped phrasing is forbidden (anti-overfitting). The multi_turn verifier asks
+  about the *request being carried out*, never about tool calls.
+- Let verify-only mutate the generation transcript, or let Phase 2 repair invoke tools
+  outside the original trajectory's tool surface (pre-registered repair budget).
+
+### Stage 3 / v1.11 adaptive-policy invariants (pinned 2026-05-20)
+
+- **score_log ownership**: `loop.py` owns the per-step convergence-score deque; `convergence.py` (`compute_convergence_score`) stays stateless. Composition boundary is the `_compute_within_run_state(score_log, tool_history, step)` signature — loop.py is the sole writer, convergence.py is the sole consumer
+- **Bias-not-lock**: no signal combination may reduce intervention probability to zero or increase it above the configured ceiling. Adaptive policy modulates intervention timing/intensity, never enables/disables. Property-tested in Phase 1
+- **Slew-rate limit**: per-step intensity-modifier delta bounded by `WHETSTONE_ADAPTIVE_MAX_INTENSITY_DELTA_PER_STEP` (default 0.3). Prevents oscillation; makes regressions smoother instead of catastrophic
+- **Disable-equivalence**: `WHETSTONE_ADAPTIVE_POLICY=0` (or unset) produces byte-identical behavior to v1.10.5
+- **Priors are log-only in v1.11**: `WHETSTONE_LOAD_PRIORS=1` reads `~/.whetstone/cohort-history/<instance>.json` and logs to events.jsonl, but does **not** influence intervention intensity (deferred to v1.11.1+)
+
+### Stage 3 / v1.11 Phase B activation — TRIED + REVERTED (2026-05-21)
+
+- **no_write bias RETIRED (KEPT)**: the no_write → write_pressure/early_bail bias is pinned at 0.0. Phase A (`project_v111_phaseA_calibration`) proved no_write non-selective (precision ≤31% — read-heavy successes hit the same depths as stalls). This is behaviorally v1.10.5-neutral (write_pressure reverts to its static schedule) and stays.
+- **score_trend → soft_anchor collapse promotion: REVERTED**. The Phase B lever raised the score<LOW band response one rung (breadth_probe → soft_anchor commitment nudge) on the confirmed-collapse signal `conv<LOW AND step>=_COLLAPSE_MIN_STEP AND trend<=0`. Phase D (n=75 ×3) showed it **net-negative**: it fired 3/3 on xarray-3305 (strong→plausible) and pylint-4661 (plausible→wrong_target), demoting tier via PREMATURE COMMITMENT, with 0 conversions and 0 Docker gain. cohort_shift_3x3 = 3 deterministic losses → HOLD. The loop.py consumer was reverted; the bias is retained as observability only.
+- **Root-cause lesson for v1.11.1**: the step-`_COLLAPSE_MIN_STEP` collapse signature cannot distinguish "truly stalled" from "mid-deep-dive with a transient low-trend dip", so the commitment nudge derails recovering trajectories. The `trend<=0` Pareto guard was necessary but NOT sufficient. A usable stall signal needs non-recovery specificity (sustained trend<=0 over K steps, or a semantic-breadth-saturation signal — the "breadth not temporal counters" direction) — NOT a single-step snapshot.
+- The "intensity-not-enable" framing (selecting a band-response message variant for an already-triggered early_bail predicate) remains a valid reading of the bias-only Must-not, should a future lever reuse the promotion mechanism with a better gate.
+
+## Must not
+- Inline prompt strings in `single.py` or `cli.py` (un-couples variants from runtime)
+- Add feature flags or backwards-compatibility shims for retired modes (swarm / micro / phased)
+- Add a new prompt variant without a corresponding test in `tests/test_prompts.py`
+- (v1.11) Mutate the score_log from `convergence.py` — ownership lives in `loop.py`
+- (v1.11) Let a Stage 3 signal hard-gate (enable/disable) an intervention dispatch — bias only
+- (v1.11) Wire cross-cycle priors into intervention intensity computation — log-only this cycle
+- (v1.11.1+) Ship `intervention_history_within_run` without capping its weight below all other Stage 3 signals AND restricting it to suppress-only (never amplify) — prevents intervention-aversion attractor
+
+## Owns
+- src/whetstone/agents/**

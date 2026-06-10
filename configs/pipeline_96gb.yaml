@@ -1,0 +1,83 @@
+omlx_base_url: "http://127.0.0.1:8000"
+
+# Track D (whetstone research fork): planner/builder split. Selected
+# structurally by cli.py — a config with BOTH a `planner` and a `builder` role
+# runs the pipeline (agents/pipeline/planner_builder.py); mono configs are
+# unaffected. Gates on the same maintain_suite, no grader changes.
+profile:
+  name: "Planner/builder 96 GB (M5 Max)"
+  description: "Gemma planner proposes a plan; Qwen-Coder builder executes it with the full tool surface."
+  memory_budget_gb: 96
+  peak_model_gb: 80.0
+  # Sequential handoff by default: census math (planner ~16 GB + 80B builder
+  # ~64 GB ≈ 80 GB weights, ~16 GB left for 2×KV under the 96 GB cap) makes
+  # co-residency marginal. Flip to true only for a smaller builder pairing the
+  # memory census confirms fits both models + KV at once.
+  coresident: false
+
+models:
+  # Planner — NOT yet staged on disk. Stage as part of bootstrap:
+  #   huggingface download mlx-community/gemma-3-27b-it-4bit, register with oMLX.
+  planner: "gemma-3-27b-it-4bit"
+  # Builder — the staged 80B coder MoE (dl-models/roster_moe.json).
+  builder: "Qwen3-Coder-Next-6bit"
+
+roles:
+  # Planner: a single constrained-decoding call (no tools, no loop). Small
+  # context — it only sees the goal + .sdd contract and emits a JSON plan.
+  planner:
+    model_key: planner
+    num_ctx: 16384
+    max_steps: 1
+    max_tokens_per_turn: 2048
+    temperature: 0.0
+
+  # Builder: full mono tool surface (parity with configs/single_64gb.yaml's
+  # monolith role). The plan is injected as advisory task context; the loop is
+  # the unchanged run_agent. Keep num_ctx at the champion baseline (32768) so
+  # Track D deltas are not confounded with Track C's context sweep.
+  builder:
+    model_key: builder
+    num_ctx: 32768
+    max_steps: 30
+    max_tokens_per_turn: 8192
+    temperature: 0.0
+    task_overlay_id: manage_strict_only
+    tools:
+      - read_file
+      - list_dir
+      - glob
+      - grep
+      - bm25_search
+      - find_symbol
+      - write_file
+      - edit_file
+      - git_diff
+      - git_log
+      - git_show
+      - bash
+      - lint
+      - typecheck
+      - security_scan
+      - deps_audit
+      - cve_lookup
+
+task_types:
+  review:
+    description: "Code review — planner/builder pipeline"
+    pipeline: [planner, builder]
+  implement:
+    description: "Feature implementation — planner/builder pipeline"
+    pipeline: [planner, builder]
+  bugfix:
+    description: "Bug investigation and fix — planner/builder pipeline"
+    pipeline: [planner, builder]
+  document:
+    description: "Documentation generation — planner/builder pipeline"
+    pipeline: [planner, builder]
+  summarize:
+    description: "Codebase summarization — planner/builder pipeline"
+    pipeline: [planner, builder]
+  manage:
+    description: "Repository management — planner/builder pipeline"
+    pipeline: [planner, builder]

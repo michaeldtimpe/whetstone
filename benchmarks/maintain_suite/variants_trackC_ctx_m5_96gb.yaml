@@ -1,0 +1,31 @@
+# Track C — context-cache scaling on M5 Max at the 96 GB cap.
+#
+# Champion HELD CONSTANT (Qwen3.6-35B-A3B-6bit); only num_ctx is swept. Tests
+# whether the 32k window luxe pinned under the 36 GB cap was leaving capability
+# on the table now that KV fits. Cheapest track.
+#
+# IMPORTANT (review): context_overflow may already be ~0 at 32k, so a bare
+# overflow-count delta can null out regardless of truth. Promote survivors to
+# the codeneedle long-context eval (the real Track C signal) and also read the
+# already-captured peak_context_pressure (× num_ctx = effective occupancy) and
+# wall-vs-ctx from each cell's diagnostics.json.
+#
+# Memory note: KV grows ~linearly with num_ctx. Champion weights ~29 GB; KV at
+# 128k is ~4× the 32k KV — still far under 96 GB for a single 35B-A3B model.
+# Run the 128k stability probe (plan §Phase 0.4) before this sweep.
+#
+# Stay ≤ oMLX max_context_window (131072).
+#
+# Run:
+#   .venv/bin/python -m benchmarks.maintain_suite.run \
+#     --variants benchmarks/maintain_suite/variants_trackC_ctx_m5_96gb.yaml \
+#     --output acceptance/trackC_ctx_m5_96gb \
+#     --per-fixture-timeout 1800 --all
+#
+# 3 cells × 10 fixtures = 30 runs. The 32k cell is the in-sweep anchor (should
+# reproduce baseline_m5_96gb); 64k / 128k are the scaling arms.
+
+variants:
+  - {mode: mono, model_label: qwen3.6-35b-a3b-6bit, model_id: Qwen3.6-35B-A3B-6bit, num_ctx: 32768}
+  - {mode: mono, model_label: qwen3.6-35b-a3b-6bit, model_id: Qwen3.6-35B-A3B-6bit, num_ctx: 65536}
+  - {mode: mono, model_label: qwen3.6-35b-a3b-6bit, model_id: Qwen3.6-35B-A3B-6bit, num_ctx: 131072}

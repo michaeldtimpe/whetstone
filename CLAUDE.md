@@ -1,0 +1,131 @@
+# Claude Code instructions for whetstone
+
+Auto-loaded at session start. Points at the durable contracts and the
+short list of project-specific gotchas.
+
+## Single-champion policy
+
+**whetstone pins exactly one MoE model: `Qwen3.6-35B-A3B-6bit`** (configured
+in `configs/single_64gb.yaml`). The M5 Max m5max_moe bake-off (2026-05-10)
+confirmed it across all eligible MoE candidates: 10/10 perfect, fastest
+wall (40.0s avg), highest TPS (72.7), no bailouts. Larger MoE
+candidates (Qwen3-Coder-Next-80B, GLM-4.5-Air-106B) also passed but
+offered no win on speed/efficiency.
+
+All ongoing development is centered on this single champion. Practical
+implications:
+
+- **Do not introduce model-fan-out**: no per-task model selection, no
+  router, no A/B against another model unless the user explicitly asks
+  for a re-bench. The bake-off is settled.
+- **Tuning and substrate fixes target this model's failure modes**.
+  When proposing changes (prompts, gates, tool surface), evaluate them
+  against `Qwen3.6-35B-A3B-6bit` first; other-model evidence is
+  secondary unless the user specifies a wider sweep.
+- **The champion is platform-stable**: it ran on M1 Max (64 GB) and is
+  the M5 Max winner. There is no platform-specific MoE champion split
+  to maintain.
+- **Don't keep alternate model configs warm**: configs in
+  `configs/_archive/` are reference-only. Don't promote them.
+
+If a re-bench is ever needed, follow `~/Downloads/whetstone/RESUME.md` §
+"M5 Max MoE bake-off" structure and produce results under
+`acceptance/m5max_moe_<rebench-id>/`.
+
+## Architecture: SpecDD Lever 2 `.sdd` chain
+
+Every directory of consequence has a `<dir>/<dir>.sdd` contract listing
+**Must / Must not / Owns / Forbids**. Walk the chain when editing:
+
+- `src/whetstone/whetstone.sdd` — root invariants (no swarm/micro/phased; temp=0; pinned work_dir; no MoE Instruct-2507; no `origin/<branch>` reads)
+- `src/whetstone/agents/agents.sdd` — prompt registry is the single source of truth
+- `src/whetstone/tools/tools.sdd` — honesty guards + Forbids enforcement order
+- `benchmarks/maintain_suite/maintain_suite.sdd` — bench rules (vacuous_test gates, `--keep-loaded`, sidecar regrade)
+
+Read the relevant `.sdd` before editing any file under that subtree.
+
+## Default-ON: TieredCompact context compaction
+
+`WHETSTONE_TIERED_COMPACT` defaults to **ON** as of 2026-05-28 (forge-hybrid cycle
+closeout, commit `9be486c`). All `run_agent` callers — SWE-bench,
+maintain_suite, BFCL — get 3-phase context compaction at
+`phase_thresholds=(0.50, 0.85, 0.95)`. Validated at n=75 across 2 reps:
+resolves equivalent to baseline within substrate noise band (±2.8); 42-56%
+wall reduction; 2 protected wrong_target instances healed; zero new damages.
+
+- **Disable for ablation**: `WHETSTONE_TIERED_COMPACT=0`. **If a workload behaves
+  unexpectedly, try this first.** Compaction default-ON is the largest
+  behavior change shipped in 2026-05.
+- **Retune**: `WHETSTONE_TIERED_COMPACT_PHASE_THRESHOLDS="p1,p2,p3"` or
+  `WHETSTONE_TIERED_COMPACT_THRESHOLD=<f>` (single-knob, sets all 3 phases).
+- See `src/whetstone/agents/agents.sdd` § "forge-hybrid Phase 2 (A) compaction
+  invariants" for the pinned tuning rationale + counter-discipline rules.
+
+## Opt-in modes (default off, byte-identical when disabled)
+
+Five subsystems are gated by env vars and default to **off**. Each has
+invariants in its `.sdd` you must read before enabling:
+
+- **Reflect / verify stage** (`WHETSTONE_REFLECT=1`) — a separate `backend.chat`
+  critique pass. Verify-only by default (non-perturbing). See
+  `src/whetstone/agents/agents.sdd` § "Reflection / verify stage invariants".
+- **Adaptive policy** (`WHETSTONE_ADAPTIVE_POLICY=1`) — convergence-score-based
+  intervention-intensity modulation. **Bias-not-lock**: never gates dispatch.
+  Slew-rate limited via `WHETSTONE_ADAPTIVE_MAX_INTENSITY_DELTA_PER_STEP`. See
+  `agents.sdd` § "Stage 3 / v1.11 adaptive-policy invariants".
+- **Cohort priors** (`WHETSTONE_LOAD_PRIORS=1`) — reads
+  `~/.whetstone/cohort-history/<instance>.json`. **Log-only in v1.11** (does not
+  influence intervention intensity); promotion deferred to v1.11.1+.
+- **Respond terminal tool** (`WHETSTONE_RESPOND_TERMINAL=1`) — exposes a
+  `respond(message=...)` tool with 4 watchdog gates (early-respond,
+  no-writes-late, passive-surrender, compaction-phantom). Forge-hybrid
+  Phase 3 (B) infrastructure; champion does not adopt the lever at any
+  tested promotion (n=14 smoke 2026-05-28: 0/14 adoption with or without
+  prompt guidance). Default-OFF; refute documented in `lessons.md`.
+- **Trajectory-shape early_bail suppression** (`WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE=1`)
+  — selectively suppresses `early_bail` when the model is in deep
+  localized reading with stable convergence. Forge-hybrid Phase 4 (D)
+  infrastructure; locked predicate fired 0/14 at n=14 smoke (too narrow
+  for this champion at num_ctx=32768). Implicit dependency on
+  `WHETSTONE_ADAPTIVE_POLICY=1` for `score_log` population. Default-OFF.
+
+If you toggle any of these on, walk the relevant `.sdd` section first —
+unbiased flips can silently change benchmark behavior.
+
+## When working on this repo
+
+1. **Mono only.** No swarm/micro/phased — they're retired. Don't add
+   feature flags to bring them back. The `Forbids:` rules in
+   `src/whetstone/whetstone.sdd` are tool-side enforced.
+2. **Prompts go through `src/whetstone/agents/prompts.py`.** Never inline
+   prompt strings in `single.py` or `cli.py` — variant cells un-couple
+   from runtime and the bake-off becomes uninterpretable.
+3. **Bench-as-truth.** Don't trust paper analysis. Run
+   `python -m benchmarks.maintain_suite.run --variants <yaml>` and
+   inspect every PASS by hand via the local-branch ref. See
+   `RESUME.md §The bench-as-truth pattern`.
+4. **`oMLX` is on `localhost:8000`** with key `OMLX_API_KEY=omlx-sdb25582k3mq8pf9`.
+5. **Read `RESUME.md` first** for current project state and active tasks.
+6. **Read `lessons.md`** for postmortems of every historical surprise.
+7. **Git: rebase, never merge.** `origin/main` enforces linear history (no merge
+   commits, no force-push — admin-bypass only). Integrate remote changes with
+   `git fetch` + rebase; never create a merge commit. A committed PreToolUse hook
+   (`.claude/hooks/precommit-pull.sh`, wired in `.claude/settings.json`) plus
+   repo-local `pull.rebase`/`rebase.autoStash` auto-rebase before each commit. See
+   `lessons.md` 2026-05-25 + memory `feedback_git_linear_history`.
+
+## When the user asks for new work
+
+Default to the established patterns:
+- New tools land with regression tests in `tests/test_tools.py`
+- New prompt variants land with tests in `tests/test_prompts.py`
+- New fixtures land with a `requirements:` block (SpecDD Lever 1 schema)
+- New `.sdd` files follow `<dir>/<dir>.sdd` placement
+- New maintain_suite fixtures that need write-time create-only restrictions
+  use `forbids_create: [glob, ...]` in fixtures.yaml; the bench harness's
+  `_inject_forbids_create_sdd` (run.py) writes a synthetic `<repo>.sdd`
+  at the cloned-repo root and adds it to `.git/info/exclude` so the
+  contract doesn't pollute fixture diffs
+
+When in doubt, look at how the most recent shipped feature did it and
+match the shape.

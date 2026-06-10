@@ -1,0 +1,88 @@
+omlx_base_url: "http://127.0.0.1:8000"
+
+profile:
+  name: "Single-model 64 GB"
+  description: "One capable model drives the whole task with the full tool surface."
+  memory_budget_gb: 64
+  peak_model_gb: 30.0
+
+models:
+  # Default monolith — promoted to Qwen3.6-35B-A3B-6bit after the overnight
+  # bake-off (2026-04-29). It produced the first production-quality
+  # implementations of `the-game` and `neon-rain` (passing tests via the
+  # existing event bus), beat all prior model/architecture combinations
+  # on real-PASS rate, and the 6-bit variant edges the 4-bit on quality.
+  # Earlier baseline (Qwen2.5-32B-Instruct-4bit) preserved below for
+  # rollback; switch via --single-config to pin to the old default.
+  monolith: "Qwen3.6-35B-A3B-6bit"
+
+# Single mode runs ONE role: the monolith. Full tool surface, agentic loop.
+# Used for smaller repos and quick fixes; escalates to swarm when the model
+# determines the task needs >10 file edits or sustained multi-component planning.
+roles:
+  monolith:
+    model_key: monolith
+    num_ctx: 32768
+    max_steps: 30
+    max_tokens_per_turn: 8192
+    temperature: 0.0    # 2026-05-01 promotion: variance probe showed
+                        # temp=0.2 produced ±2 fixture swings between
+                        # identical bench runs (4-7/10 across 3 baseline
+                        # samples); temp=0 collapses pass/fail vectors to
+                        # deterministic across two back-to-back runs.
+                        # Greedy decoding also lifts implement to 4/4
+                        # ceiling out of the box. See variants_v1_temp0_probe.yaml.
+    task_overlay_id: manage_strict_only
+                        # 2026-05-02 (Phase v1.1 B2 + ship): closes the
+                        # nothing-ever-happens-manage-deps-audit stuck-loop.
+                        # Briefly disabled mid-investigation to confirm the
+                        # variance source was the random-tempdir leak in
+                        # the bench's work_dir, not the overlay itself.
+                        # A/B with pinned work_dir confirmed: overlay
+                        # reliably closes deps-audit (cell 2 PASS), no
+                        # regressions on the 9 other fixtures (overlay
+                        # fires only on `manage` task type per
+                        # test_manage_strict_only_overlay_fires_only_on_manage_tasks).
+                        # See variants_v1_overlay_ab_pinned.yaml +
+                        # acceptance/v1_1_overlay_ab_pinned/ for the
+                        # confirmation data.
+    tools:
+      - read_file
+      - list_dir
+      - glob
+      - grep
+      - bm25_search
+      - find_symbol
+      - write_file
+      - edit_file
+      - git_diff
+      - git_log
+      - git_show
+      - bash
+      - lint
+      - typecheck
+      - security_scan
+      - deps_audit
+      - cve_lookup
+
+# Single mode does not have task-type pipelines — the monolith handles the
+# task end-to-end. Task type still influences the system prompt framing.
+task_types:
+  review:
+    description: "Code review — single-model agentic loop"
+    pipeline: [monolith]
+  implement:
+    description: "Feature implementation — single-model agentic loop"
+    pipeline: [monolith]
+  bugfix:
+    description: "Bug investigation and fix — single-model agentic loop"
+    pipeline: [monolith]
+  document:
+    description: "Documentation generation — single-model agentic loop"
+    pipeline: [monolith]
+  summarize:
+    description: "Codebase summarization — single-model agentic loop"
+    pipeline: [monolith]
+  manage:
+    description: "Repository management — single-model agentic loop"
+    pipeline: [monolith]

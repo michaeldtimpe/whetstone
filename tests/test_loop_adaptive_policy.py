@@ -1,0 +1,538 @@
+"""v1.11 Phase 1 — adaptive-policy substrate integration test.
+
+End-to-end verification of the loop.py wiring:
+  - disable-equivalence: WHETSTONE_ADAPTIVE_POLICY unset → no adaptive_state
+    events emitted; v1.10.5 behavior preserved
+  - enabled: WHETSTONE_ADAPTIVE_POLICY=1 → adaptive_state events emitted each
+    step with the signal values + convergence_score
+  - per-signal ablation: WHETSTONE_ADAPTIVE_NO_WRITE=0 → consecutive_no_write
+    field is None in emitted events (other signal still active)
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import whetstone.agents.loop as loop_module
+from whetstone.agents.loop import run_agent
+from whetstone.backend import ChatResponse, GenerationTiming, ToolCallResponse
+from whetstone.config import RoleConfig
+from whetstone.tools.base import ToolDef
+
+
+class _ScriptedBackend:
+    def __init__(self, scripted: list[ChatResponse]) -> None:
+        self._scripted = list(scripted)
+
+    def chat(self, messages, **kwargs) -> ChatResponse:
+        if not self._scripted:
+            return ChatResponse(text="", finish_reason="stop",
+                                timing=GenerationTiming(prompt_tokens=10, completion_tokens=10))
+        return self._scripted.pop(0)
+
+
+def _read_resp() -> ChatResponse:
+    return ChatResponse(
+        text="",
+        tool_calls=[ToolCallResponse(id="c", name="read_file", arguments={"path": "x.py"})],
+        finish_reason="tool_calls",
+        timing=GenerationTiming(prompt_tokens=100, completion_tokens=100),
+    )
+
+
+def _read_resp_distinct(i: int) -> ChatResponse:
+    """Read a DISTINCT file each step → diffuse recon → convergence stays low
+    with a flat/falling trend (the empty_patch collapse signature)."""
+    return ChatResponse(
+        text="",
+        tool_calls=[ToolCallResponse(
+            id=f"c{i}", name="read_file", arguments={"path": f"pkg/mod_{i}.py"})],
+        finish_reason="tool_calls",
+        timing=GenerationTiming(prompt_tokens=100, completion_tokens=100),
+    )
+
+
+def _terminal() -> ChatResponse:
+    return ChatResponse(text="done", finish_reason="stop",
+                        timing=GenerationTiming(prompt_tokens=10, completion_tokens=10))
+
+
+def _role() -> RoleConfig:
+    return RoleConfig(model_key="test", num_ctx=4096, max_steps=10,
+                      max_tokens_per_turn=2048, temperature=0.0)
+
+
+def _read_tool() -> ToolDef:
+    return ToolDef(
+        name="read_file", description="read",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    )
+
+
+def _read_fn() -> dict[str, Any]:
+    return {"read_file": lambda args: (f"contents of {args.get('path', '')}", None)}
+
+
+def _capture_events(monkeypatch):
+    """Patch append_event in loop module; return list captured calls land in."""
+    captured: list[dict] = []
+
+    def fake_append(run_id, kind, **fields):
+        captured.append({"kind": kind, **fields})
+
+    monkeypatch.setattr(loop_module, "append_event", fake_append)
+    return captured
+
+
+def test_adaptive_policy_disabled_emits_no_adaptive_state(monkeypatch):
+    """WHETSTONE_ADAPTIVE_POLICY unset → zero adaptive_state events.
+    Disable-equivalence invariant from agents.sdd."""
+    monkeypatch.delenv("WHETSTONE_ADAPTIVE_POLICY", raising=False)
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp() for _ in range(4)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=_role(),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-adaptive-policy",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    assert adaptive_events == []
+
+
+def test_adaptive_policy_enabled_emits_per_step(monkeypatch):
+    """WHETSTONE_ADAPTIVE_POLICY=1 → adaptive_state event each step with
+    consecutive_no_write + score_trend + score_log_len + convergence_score."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp() for _ in range(4)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=_role(),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-adaptive-policy",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    assert len(adaptive_events) >= 4  # one per loop step before terminal
+    sample = adaptive_events[0]
+    for k in ("consecutive_no_write", "score_trend", "score_log_len", "convergence_score", "step"):
+        assert k in sample, f"missing field {k} in adaptive_state event"
+
+    # consecutive_no_write should grow monotonically across the 4 reads.
+    no_writes = [e["consecutive_no_write"] for e in adaptive_events]
+    assert no_writes[-1] > no_writes[0]
+
+
+def test_adaptive_policy_ablation_no_write_off(monkeypatch):
+    """WHETSTONE_ADAPTIVE_NO_WRITE=0 → that signal returns None; others active."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_NO_WRITE", "0")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp() for _ in range(3)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=_role(),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-adaptive-policy",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    assert len(adaptive_events) >= 3
+    for e in adaptive_events:
+        assert e["consecutive_no_write"] is None
+        # score_trend should still be present (could be 0.0 with short log)
+        assert "score_trend" in e
+
+
+def test_adaptive_policy_modulation_neutral_below_bias_threshold(monkeypatch):
+    """At consecutive_no_write < 8 (the bias threshold), modulation must
+    stay at 1.0 → effective_wp_min_step == _WRITE_PRESSURE_MIN_STEP →
+    archetype-style short trajectories preserve v1.10.5 behavior."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    # Only 4 reads then terminal — way below the bias threshold (8).
+    scripted = [_read_resp() for _ in range(4)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=_role(),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-mod-neutral",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    # All modulation values should remain at exactly 1.0 (neutral).
+    for e in adaptive_events:
+        assert e["modulation_write_pressure"] == 1.0
+        assert e["modulation_early_bail"] == 1.0
+
+
+def test_no_write_write_pressure_retired_stays_pinned(monkeypatch):
+    """v1.11 Phase B — no_write bias RETIRED. Even with 15 consecutive
+    no-write steps (well past the old threshold 8), write_pressure AND
+    early_bail modulation must stay pinned at neutral 1.0."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp_distinct(i) for i in range(15)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=RoleConfig(
+            model_key="test", num_ctx=4096, max_steps=20,
+            max_tokens_per_turn=2048, temperature=0.0,
+        ),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-wp-retired",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    for e in adaptive_events:
+        assert e["modulation_write_pressure"] == 1.0
+        assert e["modulation_early_bail"] == 1.0
+
+
+def test_adaptive_policy_slew_rate_env_override(monkeypatch):
+    """WHETSTONE_ADAPTIVE_MAX_INTENSITY_DELTA_PER_STEP bounds the per-step change
+    of the live soft_anchor modulation."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_MAX_INTENSITY_DELTA_PER_STEP", "0.05")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp_distinct(i) for i in range(15)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=RoleConfig(
+            model_key="test", num_ctx=4096, max_steps=20,
+            max_tokens_per_turn=2048, temperature=0.0,
+        ),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-slew",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    # With max_delta = 0.05, soft_anchor modulation cannot jump > 0.05 per step.
+    mods = [e["modulation_soft_anchor"] for e in adaptive_events]
+    for i in range(1, len(mods)):
+        assert abs(mods[i] - mods[i - 1]) <= 0.05 + 1e-9, (
+            f"step {i} delta {mods[i] - mods[i-1]} exceeded slew limit 0.05"
+        )
+
+
+def test_soft_anchor_collapse_promote_reverted_never_fires(monkeypatch):
+    """v1.11 Phase B REVERT regression guard. A diffuse-recon stall that DID
+    fire the promotion before the revert (distinct reads, no writes, conv stuck
+    < LOW, flat/falling trend past _COLLAPSE_MIN_STEP, full SWE-bench env combo)
+    must now produce NO soft_anchor_collapse_promote_fired event — the
+    promotion consumer was reverted (net-negative at n=75: premature-commitment
+    tier demotion). The soft_anchor modulation is still COMPUTED (observability)
+    but nothing in dispatch acts on it."""
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL", "1")
+    monkeypatch.setenv("WHETSTONE_CONVERGENCE_GATE", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_MODE", "soft_anchor")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp_distinct(i) for i in range(14)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=RoleConfig(
+            model_key="test", num_ctx=4096, max_steps=20,
+            max_tokens_per_turn=2048, temperature=0.0,
+        ),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-promote-reverted",
+    )
+
+    # No consumer remains: the promotion event must never appear.
+    assert [e for e in events if e["kind"] == "soft_anchor_collapse_promote_fired"] == []
+    # Observability preserved: soft_anchor modulation still rises on the stall,
+    # and write_pressure stays pinned (no_write retired).
+    adaptive = [e for e in events if e["kind"] == "adaptive_state"]
+    assert any(e["modulation_soft_anchor"] > 1.0 for e in adaptive)
+    for e in adaptive:
+        assert e["modulation_write_pressure"] == 1.0
+
+
+def test_adaptive_policy_ablation_score_trend_off(monkeypatch):
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_SCORE_TREND", "0")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp() for _ in range(3)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted), role_cfg=_role(),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-adaptive-policy",
+    )
+
+    adaptive_events = [e for e in events if e["kind"] == "adaptive_state"]
+    assert len(adaptive_events) >= 3
+    for e in adaptive_events:
+        assert e["score_trend"] is None
+        assert e["consecutive_no_write"] is not None
+
+
+# ── Refined-port (WHETSTONE_EARLY_BAIL_COMMIT_ONLY) tests — 2026-05-26 ──────────
+# Suppress soft_anchor + breadth_probe variants; keep commit_imperative
+# (fires at convergence_score >= _CONVERGENCE_HIGH_THRESHOLD). Default OFF.
+
+def test_early_bail_commit_only_suppresses_low_conv_variants(monkeypatch):
+    """With flag ON + diffuse-recon reads (distinct files → low convergence,
+    breadth_probe band) the breadth_probe + soft_anchor variants must not fire,
+    and the new `early_bail_suppressed_commit_only` observability event must
+    appear when the firing branch is reached."""
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_MODE", "soft_anchor")
+    monkeypatch.setenv("WHETSTONE_CONVERGENCE_GATE", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_COMMIT_ONLY", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = [_read_resp_distinct(i) for i in range(10)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted),
+        role_cfg=RoleConfig(model_key="test", num_ctx=4096, max_steps=15,
+                            max_tokens_per_turn=2048, temperature=0.0),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-commit-only-low",
+    )
+
+    # breadth_probe + soft_anchor SUPPRESSED under commit_only
+    assert [e for e in events if e["kind"] == "early_bail_breadth_probe_fired"] == []
+    fired = [e for e in events if e["kind"] == "early_bail_fired"]
+    assert all(e.get("msg_variant") != "soft_anchor" for e in fired), \
+        f"soft_anchor variant should be suppressed under commit_only; fired={fired}"
+
+
+def test_early_bail_commit_only_preserves_commit_imperative(monkeypatch):
+    """With flag ON + same-file reads (high convergence) + standard early_bail
+    triggers, commit_imperative MUST still fire (msg_variant='commit_imperative').
+    This is the whole point of the refined port — keep the high-convergence
+    imperative, lose only the low/mid-convergence variants."""
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_MODE", "soft_anchor")
+    monkeypatch.setenv("WHETSTONE_CONVERGENCE_GATE", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_COMMIT_ONLY", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    # Same-file reads → convergence climbs above HIGH (0.40) → commit_imperative
+    # branch is selected. _read_resp reads x.py repeatedly.
+    scripted = [_read_resp() for _ in range(6)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted),
+        role_cfg=RoleConfig(model_key="test", num_ctx=4096, max_steps=10,
+                            max_tokens_per_turn=2048, temperature=0.0),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-commit-only-high",
+    )
+
+    fired = [e for e in events if e["kind"] == "early_bail_fired"]
+    assert any(e.get("msg_variant") == "commit_imperative" for e in fired), \
+        f"commit_imperative must still fire under commit_only at high conv; fired={fired}"
+
+
+# ── Phase 4 (D) trajectory-shape predicate tests — 2026-05-28 ──────────────
+# Selective early_bail suppression on "deep localized reading with stable
+# convergence". Gated by WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE=1; default OFF.
+
+from whetstone.agents.convergence import (
+    ShapeSignals,
+    should_suppress_for_trajectory_shape,
+    trajectory_shape_signals,
+)
+
+
+def test_signals_compute_correctly_on_known_history():
+    """Hand-crafted history + score_log → each of the 4 signals comes out
+    to a specific, hand-verifiable value over the W=4 window."""
+    # W=4 window with: 1 grep + 3 reads, all on the same path → low
+    # grep_vs_read_ratio, low breadth_saturation. Score_log monotonically
+    # non-increasing (4 deltas) → sustained_low_trend = 4. early_bail_step=2
+    # so all 4 entries (steps 3-6) qualify as post-bail → rate = 4/4 = 1.0.
+    history = [
+        {"step": 3, "name": "grep", "path": "pkg/mod.py"},
+        {"step": 4, "name": "read_file", "path": "pkg/mod.py"},
+        {"step": 5, "name": "read_file", "path": "pkg/mod.py"},
+        {"step": 6, "name": "read_file", "path": "pkg/mod.py"},
+    ]
+    score_log = [0.5, 0.4, 0.4, 0.3, 0.2]
+    signals = trajectory_shape_signals(
+        history, score_log, step=6, early_bail_step=2,
+    )
+    # 1 grep / (3 reads + 1) = 0.25
+    assert signals.grep_vs_read_ratio == 0.25
+    # 4 consecutive non-increasing deltas
+    assert signals.sustained_low_trend == 4
+    # 1 unique path / 4 calls = 0.25
+    assert signals.breadth_saturation == 0.25
+    # all 4 in W have step >= 2 → 4/4 = 1.0
+    assert signals.post_bail_call_rate == 1.0
+
+
+def test_predicate_fires_on_fix_shape():
+    """sustained_low_trend=4, grep_vs_read_ratio=0.2, breadth_saturation=0.4
+    → True (deep localized reading with stable convergence)."""
+    signals = ShapeSignals(
+        grep_vs_read_ratio=0.2,
+        sustained_low_trend=4,
+        breadth_saturation=0.4,
+        post_bail_call_rate=0.0,
+    )
+    assert should_suppress_for_trajectory_shape(signals) is True
+
+
+def test_predicate_does_not_fire_on_wrong_target_shape():
+    """sustained_low_trend=4, grep_vs_read_ratio=0.2, breadth_saturation=0.8
+    → False (breadth too high → not localized)."""
+    signals = ShapeSignals(
+        grep_vs_read_ratio=0.2,
+        sustained_low_trend=4,
+        breadth_saturation=0.8,
+        post_bail_call_rate=0.0,
+    )
+    assert should_suppress_for_trajectory_shape(signals) is False
+
+
+def test_flag_off_byte_identical(monkeypatch):
+    """Without WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE, EarlyBailGuard evaluation
+    matches the pre-Phase-4 baseline behavior: no
+    `early_bail_suppressed_trajectory_shape` event is emitted regardless
+    of the trajectory shape."""
+    monkeypatch.delenv("WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE", raising=False)
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_MODE", "soft_anchor")
+    monkeypatch.setenv("WHETSTONE_CONVERGENCE_GATE", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    # Same-file reads → high convergence + sustained trend; would fire the
+    # trajectory-shape predicate if the env var were set.
+    scripted = [_read_resp() for _ in range(8)] + [_terminal()]
+    run_agent(
+        backend=_ScriptedBackend(scripted),
+        role_cfg=RoleConfig(model_key="test", num_ctx=4096, max_steps=12,
+                            max_tokens_per_turn=2048, temperature=0.0),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool()], tool_fns=_read_fn(),
+        run_id="test-traj-shape-off",
+    )
+
+    assert [e for e in events
+            if e["kind"] == "early_bail_suppressed_trajectory_shape"] == []
+
+
+def _noop_resp(i: int) -> ChatResponse:
+    """Call a pathless 'noop' tool with unique args per step (so the
+    loop's consecutive_repeat dedup doesn't abort the trajectory).
+    Path-less tool history entries keep both convergence_score and
+    breadth_saturation flat — the minimal way to construct a trajectory
+    where sustained_low_trend climbs without the breadth-saturation
+    signal also climbing."""
+    return ChatResponse(
+        text="",
+        tool_calls=[ToolCallResponse(
+            id=f"n{i}", name="noop", arguments={"n": i})],
+        finish_reason="tool_calls",
+        timing=GenerationTiming(prompt_tokens=100, completion_tokens=100),
+    )
+
+
+def _noop_tool() -> ToolDef:
+    return ToolDef(
+        name="noop", description="no-op",
+        parameters={"type": "object",
+                    "properties": {"n": {"type": "integer"}},
+                    "required": []},
+    )
+
+
+def _noop_fn() -> dict[str, Any]:
+    return {"noop": lambda args: ("ok", None)}
+
+
+def test_suppression_event_emits_with_correct_fields(monkeypatch):
+    """With WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE=1 + a trajectory whose shape
+    matches the suppression predicate, the loop emits
+    `early_bail_suppressed_trajectory_shape` with all 4 signal values.
+
+    Strategy: 4 distinct-file reads (steps 1-4) push the convergence
+    score down to 0.0 and trigger the convergence_gate's diffuse
+    suppression at step 4 (early_bail_fired stays False). Then 4 noop
+    calls (steps 5-8) keep both the convergence score AND the W=4 window
+    flat (path=None entries). At step 8 the score_log shows sustained
+    non-increasing deltas (sustained_low_trend >= 3) AND the W=4 window
+    contains only path=None entries (breadth_saturation = 0.25) — the
+    trajectory-shape predicate fires before the convergence_gate
+    diffuse-suppression branch is reached.
+    """
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_TRAJECTORY_SHAPE", "1")
+    monkeypatch.setenv("WHETSTONE_ADAPTIVE_POLICY", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL", "1")
+    monkeypatch.setenv("WHETSTONE_EARLY_BAIL_MODE", "soft_anchor")
+    monkeypatch.setenv("WHETSTONE_CONVERGENCE_GATE", "1")
+    monkeypatch.setenv("WHETSTONE_LOG_TOOL_CALLS", "1")
+    events = _capture_events(monkeypatch)
+
+    scripted = (
+        [_read_resp_distinct(i) for i in range(4)]
+        + [_noop_resp(i) for i in range(6)]
+        + [_terminal()]
+    )
+    tool_fns = {**_read_fn(), **_noop_fn()}
+    run_agent(
+        backend=_ScriptedBackend(scripted),
+        role_cfg=RoleConfig(model_key="test", num_ctx=4096, max_steps=15,
+                            max_tokens_per_turn=2048, temperature=0.0),
+        system_prompt="sys", task_prompt="do work",
+        tool_defs=[_read_tool(), _noop_tool()],
+        tool_fns=tool_fns,
+        run_id="test-traj-shape-emit",
+    )
+
+    suppressed = [e for e in events
+                  if e["kind"] == "early_bail_suppressed_trajectory_shape"]
+    assert suppressed, (
+        f"expected at least one early_bail_suppressed_trajectory_shape event; "
+        f"all events kinds = {[e['kind'] for e in events]}"
+    )
+    sample = suppressed[0]
+    for k in (
+        "sustained_low_trend",
+        "grep_vs_read_ratio",
+        "breadth_saturation",
+        "post_bail_call_rate",
+        "step",
+        "phase",
+    ):
+        assert k in sample, (
+            f"missing field {k} in early_bail_suppressed_trajectory_shape "
+            f"payload {sample}"
+        )
+
+
+def test_score_log_too_short_returns_zero_trend():
+    """score_log with 0 or 1 entries → sustained_low_trend = 0 (can't
+    compute a delta without at least 2 entries)."""
+    history = [{"step": 1, "name": "read_file", "path": "x.py"}]
+    # 0-entry score_log
+    signals_empty = trajectory_shape_signals(history, [], step=1)
+    assert signals_empty.sustained_low_trend == 0
+    # 1-entry score_log
+    signals_one = trajectory_shape_signals(history, [0.5], step=1)
+    assert signals_one.sustained_low_trend == 0

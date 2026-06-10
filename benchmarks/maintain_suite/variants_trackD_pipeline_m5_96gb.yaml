@@ -1,0 +1,53 @@
+# Track D — planner/builder split on M5 Max at the 96 GB cap (HEADLINE).
+#
+# Gemma plans → Qwen-Coder builds. The pipeline cell (mode: pipeline) bases off
+# configs/pipeline_96gb.yaml; cli.py auto-runs run_planner_builder when a config
+# carries both planner+builder roles. The builder reuses the unchanged mono loop
+# (run_agent) with full tool surface — tool parity is structural.
+#
+# maintain_suite is a SMOKE GATE for Track D, NOT evidence (review): the fixtures
+# are short and may not exercise the decomposition / long-horizon gains a planner
+# helps with. A 10/10 tie with the champion is a PASS-TO-PROMOTE — Track D's real
+# evidence is SWE-bench n=75 / BFCL vs the mono builder. Do NOT queue the 6–8 h
+# BFCL run until the run_planner_builder smoke (tests/test_planner_builder.py +
+# a 1–2 fixture live run) is green.
+#
+# Cells:
+#   1. pipeline: Gemma-3-27B planner → Qwen3-Coder-Next-80B builder (the bet)
+#   2. mono control: the SAME builder model alone (isolates the planner's effect)
+#   (Champion baseline_m5_96gb is the third reference point.)
+#
+# Memory (census, plan §Phase 0.3): planner ~16 GB + 80B builder ~64 GB ≈ 80 GB
+# weights → coresident:false (default) does a sequential unload+thermal_guard
+# handoff between Pass 1 and Pass 2. Stage Gemma first (dl-models/roster_planner.json).
+#
+# Run (smoke first):
+#   .venv/bin/python -m benchmarks.maintain_suite.run \
+#     --variants benchmarks/maintain_suite/variants_trackD_pipeline_m5_96gb.yaml \
+#     --output acceptance/trackD_pipeline_m5_96gb \
+#     --id lpe-rope-calc-implement-strict-flag --per-fixture-timeout 1800   # 1-fixture smoke
+#   # then drop --id for the full n=10.
+
+variants:
+  - mode: pipeline
+    model_label: qwen3-coder-next-80b-a3b-6bit
+    model_id: Qwen3-Coder-Next-6bit
+    planner_label: gemma3-27b
+    planner_model_id: gemma-3-27b-it-4bit
+    coresident: false
+  # Mono control — same builder model, no planner — isolates the planner's lift.
+  - {mode: mono, model_label: qwen3-coder-next-80b-a3b-6bit, model_id: Qwen3-Coder-Next-6bit}
+
+  # Co-resident pairing — Qwen3-Coder-30B-A3B builder + Gemma-3-27B planner both
+  # stay resident (≈23G + 16G + 2×KV << 96G), so the planner→builder handoff
+  # has NO swap latency. This isolates the planner's QUALITY lift from the
+  # swap-time confound the 80B pairing introduces. coresident:true skips the
+  # unload/thermal_guard handoff.
+  - mode: pipeline
+    model_label: qwen3-coder-30b-a3b-6bit
+    model_id: Qwen3-Coder-30B-A3B-Instruct-6bit
+    planner_label: gemma3-27b
+    planner_model_id: gemma-3-27b-it-4bit
+    coresident: true
+  # Mono control for the co-resident builder (30B alone, no planner).
+  - {mode: mono, model_label: qwen3-coder-30b-a3b-6bit, model_id: Qwen3-Coder-30B-A3B-Instruct-6bit}

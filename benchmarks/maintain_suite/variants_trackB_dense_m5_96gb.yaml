@@ -1,0 +1,36 @@
+# Track B — large-dense reopen on M5 Max at the 96 GB cap.
+#
+# deluxe CLOSED the dense track 2026-05-12: best dense (Qwen2.5-72B-AWQ) hit
+# 4/10, 6.4× slower than the MoE champion, under the 36 GB M1 cap. Hypothesis:
+# the 4/10 ceiling was 36 GB KV thrashing, and 96 GB headroom removes it.
+# DIAGNOSTIC, not a likely champion — temper expectations (whetstone.sdd).
+#
+# PRE-REGISTER before running: read deluxe's acceptance/m5max_dense/comparison.json
+# and record WHICH failure modes the 6 non-passes were (timeout / wrong-diff /
+# context_overflow / stuck_no_output). Track B then distinguishes "KV headroom
+# fixed it" from "memory was never the dominant bottleneck — the dense model is
+# just weaker at coding/tool-use".
+#
+# Memory peak per cell (weights + ~6–9 GB KV at 32k):
+#   Qwen2.5-32B-Instruct-4bit:        ~19 GB +  6 GB =  ~25 GB  (deluxe floor)
+#   Qwen2.5-72B-Instruct-4bit-AWQ:    ~40 GB +  8 GB =  ~48 GB
+#   Llama-3.3-70B-Instruct-8bit:      ~74 GB +  8 GB =  ~82 GB  ← the 96 GB reopen
+#   Mistral-Large-2411 Q4 MLX:        ~68 GB +  9 GB =  ~77 GB  (only if oMLX links mistral_common)
+#
+# Run (after the baseline determinism check passes):
+#   .venv/bin/python -m benchmarks.maintain_suite.run \
+#     --variants benchmarks/maintain_suite/variants_trackB_dense_m5_96gb.yaml \
+#     --output acceptance/trackB_dense_m5_96gb \
+#     --per-fixture-timeout 1800 --all
+#
+# unload_all_loaded() fires on variant rotation (see run.py) so the 82 GB
+# Llama-8bit cell never stacks on top of the prior resident.
+
+variants:
+  - {mode: mono, model_label: qwen25-32b-instruct-4bit,     model_id: Qwen2.5-32B-Instruct-4bit}
+  - {mode: mono, model_label: qwen25-72b-instruct-4bit-awq, model_id: Qwen2.5-72B-Instruct-4bit-AWQ}
+  # The 96 GB reopen: 8-bit Llama-3.3-70B never fit under the 36 GB M1 cap.
+  - {mode: mono, model_label: llama-33-70b-instruct-8bit,   model_id: Llama-3.3-70B-Instruct-8bit}
+  # Mistral-Large-2411: tool calling lives in mistral_common, which oMLX did not
+  # link as of 2026-05-10 (deluxe dropped it). Re-add only once oMLX links it.
+  # - {mode: mono, model_label: mistral-large-2411-q4-mlx,  model_id: Mistral-Large-Instruct-2411-Q4-MLX}

@@ -1,0 +1,6 @@
+# Track B (2-cell) — the live dense cells: 72B-AWQ (the 4/10-ceiling key test) and
+# Llama-3.3-70B-8bit (new quant). Qwen2.5-32B-4bit split out: its archive snapshot
+# is corrupt (empty snapshots/<sha>, orphaned blobs) — re-downloading separately.
+variants:
+  - {mode: mono, model_label: qwen25-72b-instruct-4bit-awq, model_id: Qwen2.5-72B-Instruct-4bit-AWQ}
+  - {mode: mono, model_label: llama-33-70b-instruct-8bit,   model_id: Llama-3.3-70B-Instruct-8bit}

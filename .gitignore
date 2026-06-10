@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Luxe runtime state — per-run checkpoints, repo locks, MCP audit log
+.luxe/
+
+# Claude Code: track shared project settings + hooks; ignore local state
+# (settings.local.json, plan/scheduled-task locks, anything else under .claude/)
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+
+# Local repo clones (cloned by `luxe maintain <url>`)
+local-cache/
+
+# Run/benchmark artifacts kept locally unless explicitly tracked
+runs/
+acceptance/
+logs/
+results/**/*.log
+results/**/*.tmp
+results/**/*.partial
+
+# Uv / pip local state
+.uv/
+
+# Sibling projects in this workspace that aren't part of luxe
+/ecliptic/
+/warrens/
+
+# Bench artefacts — fixture state lives in acceptance/; per-suite JSON
+# dumps are timestamped and not source-of-truth.
+acceptance/
+benchmarks/bench_*.json
+benchmarks/small_models_*.json
+
+# Benchmark dataset dumps (re-downloadable; large) — frozen subsets at
+# benchmarks/<bench>/subsets/v*_*.json are tracked, raw dataset dumps
+# are not.
+benchmarks/swebench/subsets/raw/
