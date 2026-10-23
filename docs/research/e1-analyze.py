@@ -24,7 +24,7 @@ from collections import Counter, defaultdict
 from glob import glob
 from pathlib import Path
 
-WHETSTONE_ROOT = Path("~/Downloads/whetstone")
+WHETSTONE_ROOT = Path("~/Downloads/whetstone").expanduser()
 ACCEPTANCE = WHETSTONE_ROOT / "acceptance"
 OUT_DIR = Path(__file__).resolve().parent
 

@@ -21,7 +21,7 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
-WHETSTONE_ROOT = Path("~/Downloads/whetstone")
+WHETSTONE_ROOT = Path("~/Downloads/whetstone").expanduser()
 ACCEPTANCE = WHETSTONE_ROOT / "acceptance"
 OUT_DIR = Path(__file__).resolve().parent
 CLIFF_OUTCOMES = {"CONTEXT_EXHAUSTED", "EMPTY_PATCH_CONTEXT_EXHAUSTED"}

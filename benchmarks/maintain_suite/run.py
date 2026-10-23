@@ -497,7 +497,7 @@ def _resolve_repo(fixture: Fixture, work_dir: Path) -> tuple[Path | None, str]:
                         return None, f"{' '.join(cmd)} failed: {r.stderr.strip()}"
             _inject_forbids_create_sdd(target, fixture.forbids_create)
             return target, ""
-        r = subprocess.run(["git", "clone", "--quiet", fixture.repo_url, str(target)],
+        r = subprocess.run(["git", "clone", "--quiet", os.path.expanduser(fixture.repo_url), str(target)],
                            capture_output=True, text=True, check=False)
         if r.returncode != 0:
             return None, f"git clone failed: {r.stderr.strip()[:200]}"
